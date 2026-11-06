@@ -1,0 +1,20 @@
+# Render Blueprint（テスト用。Freeプランで数回だけ試して終わらせる前提）
+# 使い方: このファイルを含め、prototype/ の中身をGitHubリポジトリの直下に置く。
+# Renderで Blueprint を使わず手動で作る場合も、buildCommand / startCommand /
+# healthCheckPath / plan は同じ値を入れること。
+# 秘密値はここには書かない。Renderダッシュボードの Environment Variables で入れる。
+
+services:
+  - type: web
+    name: line-qa-bot-test
+    env: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --timeout 60
+    healthCheckPath: /health
+    envVars:
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
