@@ -4,6 +4,10 @@
 - 質問が来てもすぐには返信しない。GitHubリポジトリに質問ファイルを1つ作るだけ。
 - 親指（Muse）が定期的に（または手動で）GitHubを見て、未回答のファイルに回答を書き込む。
 - このサーバーが30秒おきにGitHubを見て、回答済みのファイルを LINE Push API で送る。
+- 【v2 変更】ポーラーは app.py から外し、別プロセスの poller.py に移した。
+  gunicorn ワーカーのスレッドとして動かすと、WORKER TIMEOUT でワーカーごと
+  殺されたときにポーラーも一緒に消えてしまうため。app.py は Webhook 専用になった。
+  起動は start_render.sh から行う（poller.py を先に起動してから gunicorn）。
 
 置き場: GitHubリポジトリ taiseikaijinzaiweb1-glitch / LINE-test、ブランチ main
   フォルダ: queue/
@@ -169,46 +173,6 @@ def push_message(user_id: str, text: str) -> bool:
         return False
 
 
-def poll_github_loop() -> None:
-    """30秒おきに queue/ を見て、回答済み・未送信のファイルを Push で送る。"""
-    while True:
-        try:
-            listing = gh_request("GET", f"/repos/{GITHUB_REPO}/contents/{QUEUE_DIR}?ref={GITHUB_BRANCH}")
-            if isinstance(listing, list):
-                for item in listing:
-                    if item.get("type") != "file" or not item.get("name", "").endswith(".json"):
-                        continue
-                    path = item["path"]
-                    detail = gh_request("GET", f"/repos/{GITHUB_REPO}/contents/{path}?ref={GITHUB_BRANCH}")
-                    if not isinstance(detail, dict) or "content" not in detail:
-                        continue
-                    try:
-                        body = json.loads(base64.b64decode(detail["content"]).decode("utf-8"))
-                    except Exception:
-                        continue
-                    if body.get("status") == "回答済み" and not body.get("sent") and body.get("answer", "").strip() and body.get("userId"):
-                        log.info("回答済みのファイル %s を Push します", path)
-                        if push_message(body["userId"], body["answer"]):
-                            body["status"] = "送信済み"
-                            body["sent"] = True
-                            content = base64.b64encode(
-                                json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
-                            ).decode("utf-8")
-                            gh_request(
-                                "PUT",
-                                f"/repos/{GITHUB_REPO}/contents/{path}",
-                                {
-                                    "message": f"Mark sent {path}",
-                                    "content": content,
-                                    "sha": detail.get("sha"),
-                                    "branch": GITHUB_BRANCH,
-                                },
-                            )
-        except Exception as exc:
-            log.error("GitHubの確認中にエラー: %s", exc)
-        time.sleep(30)
-
-
 def verify_signature(body: bytes, signature: str | None) -> bool:
     if not CHANNEL_SECRET or not signature:
         return False
@@ -266,8 +230,8 @@ def webhook():
     return jsonify({"status": "ok"}), 200
 
 
-# 起動時にポーラーを1本だけ立てる（gunicorn workers=1 の前提）
-threading.Thread(target=poll_github_loop, daemon=True).start()
+# ポーラーはここでは立てない。別プロセスの poller.py が担当する。
+# （v2: gunicorn ワーカーのスレッドだと WORKER TIMEOUT で一緒に消えるため）
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
