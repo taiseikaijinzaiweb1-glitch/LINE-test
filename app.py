@@ -1,32 +1,28 @@
-"""LINE Webhook（GitHub経由版・テスト用）.
+"""LINE Webhook（検知専用版・テスト用）.
 
-今までの app.py との違い:
-- 質問が来てもすぐには返信しない。GitHubリポジトリに質問ファイルを1つ作るだけ。
-- 親指（Muse）が定期的に（または手動で）GitHubを見て、未回答のファイルに回答を書き込む。
-- このサーバーが30秒おきにGitHubを見て、回答済みのファイルを LINE Push API で送る。
-- 【v2 変更】ポーラーは app.py から外し、別プロセスの poller.py に移した。
-  gunicorn ワーカーのスレッドとして動かすと、WORKER TIMEOUT でワーカーごと
-  殺されたときにポーラーも一緒に消えてしまうため。app.py は Webhook 専用になった。
-  起動は start_render.sh から行う（poller.py を先に起動してから gunicorn）。
+目的: Webhookで届いた質問をすぐMuse側に知らせるための受け口。
+  返信はこのサーバーでは送らない。Muse側（Hookワーカー）が Push API で送る。
+
+動き:
+- POST /webhook: 署名を検証し、テキストメッセージの最新1件をメモリに保存する。
+  予備としてGitHubの queue/ にも質問ファイルを1つ作る（従来のv2と同じ）。
+  GitHubへの書き込みに失敗しても、メモリへの保存と200応答は続ける。
+- GET /latest-question: 最新の質問を返す。Hookが5秒おきに読む。
+  {"status": "ok", "question": ..., "userId": ..., "received_at": ...,
+   "replyToken": ..., "detected_at": ...} または {"status": "empty"}
+- GET /health: 動作確認用。mode は "webhook-detect"。
 
 置き場: GitHubリポジトリ taiseikaijinzaiweb1-glitch / LINE-test、ブランチ main
-  フォルダ: queue/
-  ファイル: 1つの質問に1つ。例 queue/20261106-173000-a1b2.json
-  中身: {"datetime": "2026-11-06 17:30:00", "userId": "...", "question": "...",
-          "status": "未回答", "answer": "", "sent": false}
-  状態の流れ: 未回答 -> 回答済み（親指が書く） -> 送信済み（このサーバーが送ったあと）
+  このファイルを GitHub の app.py として上書きして使うこと。
+  起動は今までと同じ start_render.sh（poller.py は残るが、GitHubに
+  回答済みファイルが無ければ何も送らないため、HookのPushと重複しない）。
 
 環境変数（Render の Environment Variables に入れる。値はチャットに貼らない）:
   LINE_CHANNEL_SECRET
-  LINE_CHANNEL_ACCESS_TOKEN
-  GITHUB_TOKEN          … GitHub の Personal Access Token（Contents: Read and write）
+  LINE_CHANNEL_ACCESS_TOKEN（このアプリでは使わない。PushはMuse側で行う）
+  GITHUB_TOKEN          … 予備のキュー書き込み用（無くても検知は動く）
   GITHUB_REPO           … 既定は taiseikaijinzaiweb1-glitch/LINE-test
   GITHUB_BRANCH         … 既定は main
-
-追加のライブラリは要らない。GitHub API は標準ライブラリの urllib だけで呼ぶ。
-起動は今までと同じ: gunicorn app:app --bind 0.0.0.0:$PORT
-このファイルを GitHub の app.py として上書きして使うこと。
-上書きする前に、今の app.py を app_immediate.py として残しておくこと。
 """
 
 from __future__ import annotations
@@ -51,12 +47,11 @@ from flask import Flask, jsonify, request
 from qa import RuleBook
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("line-qa-bot-github")
+log = logging.getLogger("line-qa-bot-detect")
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_DOCX = BASE_DIR / "rules.docx"
 
-LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 GITHUB_API = "https://api.github.com"
 
 
@@ -74,7 +69,6 @@ def load_dotenv(path: Path = BASE_DIR / ".env") -> None:
 load_dotenv()
 
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET", "")
-CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN", "")
 RULES_DOCX = os.environ.get("RULES_DOCX", str(DEFAULT_DOCX))
 PORT = int(os.environ.get("PORT", "8000"))
 
@@ -91,6 +85,10 @@ except Exception as exc:
     log.error("就業規則の読み込みに失敗しました: %s", exc)
 
 app = Flask(__name__)
+
+# 最新の質問1件（メモリ内のみ。gunicornはワーカー1のため共有できる）
+_LATEST_LOCK = threading.Lock()
+LATEST: dict = {"status": "empty"}
 
 
 def gh_request(method: str, path: str, payload: dict | None = None) -> dict | list | None:
@@ -122,8 +120,8 @@ def gh_request(method: str, path: str, payload: dict | None = None) -> dict | li
         return None
 
 
-def create_question_file(user_id: str, question: str) -> bool:
-    now = datetime.now(timezone(timedelta(hours=9)))
+def create_question_file(user_id: str, question: str, now: datetime) -> bool:
+    """予備としてGitHubの queue/ に質問ファイルを1つ作る。失敗しても検知は続く。"""
     rand = "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
     fname = f"{now.strftime('%Y%m%d-%H%M%S')}-{rand}.json"
     path = f"{QUEUE_DIR}/{fname}"
@@ -147,32 +145,6 @@ def create_question_file(user_id: str, question: str) -> bool:
     return True
 
 
-def push_message(user_id: str, text: str) -> bool:
-    if not CHANNEL_ACCESS_TOKEN:
-        log.warning("LINE_CHANNEL_ACCESS_TOKEN 未設定のため Push を送りません")
-        return False
-    payload = json.dumps(
-        {"to": user_id, "messages": [{"type": "text", "text": text}]},
-        ensure_ascii=False,
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        LINE_PUSH_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            log.info("LINE push API: HTTP %s", resp.status)
-            return True
-    except Exception as exc:
-        log.error("LINE push API 呼び出しに失敗しました: %s", exc)
-        return False
-
-
 def verify_signature(body: bytes, signature: str | None) -> bool:
     if not CHANNEL_SECRET or not signature:
         return False
@@ -186,10 +158,9 @@ def health():
     return jsonify(
         {
             "status": "ok" if RULEBOOK else "rules-load-error",
-            "mode": "github-queue",
+            "mode": "webhook-detect",
             "articles": len(RULEBOOK.articles) if RULEBOOK else 0,
             "channel_secret_configured": bool(CHANNEL_SECRET),
-            "channel_access_token_configured": bool(CHANNEL_ACCESS_TOKEN),
             "github_token_configured": bool(GITHUB_TOKEN),
             "github_repo": GITHUB_REPO,
         }
@@ -198,7 +169,13 @@ def health():
 
 @app.get("/")
 def index():
-    return jsonify({"service": "line-qa-bot github-queue (test)", "health": "/health", "webhook": "/webhook"})
+    return jsonify({"service": "line-qa-bot webhook-detect (test)", "health": "/health", "latest": "/latest-question", "webhook": "/webhook"})
+
+
+@app.get("/latest-question")
+def latest_question():
+    with _LATEST_LOCK:
+        return jsonify(dict(LATEST))
 
 
 @app.post("/webhook")
@@ -223,15 +200,25 @@ def webhook():
         user_id = event.get("source", {}).get("userId", "")
         if not question or not user_id:
             continue
+        now = datetime.now(timezone(timedelta(hours=9)))
+        received_at = now.strftime("%Y-%m-%dT%H:%M")
+        record = {
+            "status": "ok",
+            "question": question,
+            "userId": user_id,
+            "received_at": received_at,
+            "replyToken": event.get("replyToken", ""),
+            "detected_at": now.isoformat(timespec="seconds"),
+        }
+        with _LATEST_LOCK:
+            LATEST.clear()
+            LATEST.update(record)
         log.info("Q: %r (user=%s)", question[:60], user_id[:8])
-        # すぐ返信しない。GitHubにファイルを作るだけ。LINEには200をすぐ返す。
-        threading.Thread(target=create_question_file, args=(user_id, question), daemon=True).start()
+        # 返信は送らない。予備のキュー書き込みだけ別スレッドで行う。
+        threading.Thread(target=create_question_file, args=(user_id, question, now), daemon=True).start()
 
     return jsonify({"status": "ok"}), 200
 
-
-# ポーラーはここでは立てない。別プロセスの poller.py が担当する。
-# （v2: gunicorn ワーカーのスレッドだと WORKER TIMEOUT で一緒に消えるため）
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
